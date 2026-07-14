@@ -1,0 +1,149 @@
+name: Synthetic Stripe Subscription Monitor
+
+on:
+  schedule:
+    # 08:00 UTC todos los dias — fuera de horas punta, antes de que empiece
+    # el trafico real del dia en España.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Región a probar (ES, MX o US). Vacío = la que toque hoy por rotación."
+        required: false
+        type: choice
+        options: ["", "ES", "MX", "US"]
+
+jobs:
+  monitor:
+    name: Subscribe → Upgrade → Upgrade → Cancel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+      DIRECT_URL: ${{ secrets.PROD_DIRECT_URL }}
+      JWT_SECRET: ${{ secrets.PROD_JWT_SECRET }}
+      STRIPE_TEST_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+      SYNTHETIC_MONITOR_EMAIL: ${{ secrets.SYNTHETIC_MONITOR_EMAIL }}
+      SYNTHETIC_MONITOR_BASE_URL: https://miwebdeboda.com
+      PROXY_ES_SERVER: ${{ secrets.PROXY_ES_SERVER }}
+      PROXY_ES_USERNAME: ${{ secrets.PROXY_ES_USERNAME }}
+      PROXY_ES_PASSWORD: ${{ secrets.PROXY_ES_PASSWORD }}
+      PROXY_MX_SERVER: ${{ secrets.PROXY_MX_SERVER }}
+      PROXY_MX_USERNAME: ${{ secrets.PROXY_MX_USERNAME }}
+      PROXY_MX_PASSWORD: ${{ secrets.PROXY_MX_PASSWORD }}
+      PROXY_US_SERVER: ${{ secrets.PROXY_US_SERVER }}
+      PROXY_US_USERNAME: ${{ secrets.PROXY_US_USERNAME }}
+      PROXY_US_PASSWORD: ${{ secrets.PROXY_US_PASSWORD }}
+
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      # Checkout cross-repo: este repo (publico) no contiene el codigo de la
+      # app ni de los tests -- los trae del repo privado en cada ejecucion,
+      # usando un token de solo lectura scoped SOLO a wedding-invite-2. Asi
+      # nunca hay una copia duplicada que pueda quedarse desactualizada.
+      - uses: actions/checkout@v4
+        with:
+          repository: dieg092/wedding-invite-2
+          token: ${{ secrets.CHECKOUT_PAT }}
+          path: app
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
+      - name: Determine today's region
+        run: |
+          if [ -n "${{ inputs.region }}" ]; then
+            REGION="${{ inputs.region }}"
+          else
+            DOW=$(date -u +%u)
+            IDX=$(( (DOW - 1) % 3 ))
+            REGIONS=(ES MX US)
+            REGION="${REGIONS[$IDX]}"
+          fi
+          echo "Región de hoy: $REGION"
+          echo "REGION=$REGION" >> "$GITHUB_ENV"
+
+      - name: Resolve proxy credentials for today's region
+        run: |
+          case "$REGION" in
+            ES)
+              echo "PROXY_SERVER=$PROXY_ES_SERVER" >> "$GITHUB_ENV"
+              echo "PROXY_USERNAME=$PROXY_ES_USERNAME" >> "$GITHUB_ENV"
+              echo "PROXY_PASSWORD=$PROXY_ES_PASSWORD" >> "$GITHUB_ENV"
+              ;;
+            MX)
+              echo "PROXY_SERVER=$PROXY_MX_SERVER" >> "$GITHUB_ENV"
+              echo "PROXY_USERNAME=$PROXY_MX_USERNAME" >> "$GITHUB_ENV"
+              echo "PROXY_PASSWORD=$PROXY_MX_PASSWORD" >> "$GITHUB_ENV"
+              ;;
+            US)
+              echo "PROXY_SERVER=$PROXY_US_SERVER" >> "$GITHUB_ENV"
+              echo "PROXY_USERNAME=$PROXY_US_USERNAME" >> "$GITHUB_ENV"
+              echo "PROXY_PASSWORD=$PROXY_US_PASSWORD" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Región desconocida: $REGION" >&2
+              exit 1
+              ;;
+          esac
+          echo "EXPECTED_COUNTRY=$REGION" >> "$GITHUB_ENV"
+
+      - name: Ensure canary account exists
+        run: pnpm synthetic:setup-canary
+
+      - name: Mint session for canary account
+        run: pnpm synthetic:mint-session
+
+      - name: Get installed Playwright version
+        id: playwright-version
+        run: echo "version=$(node -e "console.log(require('@playwright/test/package.json').version)")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browser binary (chromium)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
+        timeout-minutes: 5
+
+      - name: Install Playwright OS dependencies
+        run: pnpm exec playwright install-deps chromium
+
+      - name: Check proxy region
+        run: npx tsx scripts/synthetic-monitor-check-proxy-region.ts
+
+      - name: Run subscription lifecycle against production
+        run: pnpm test:e2e:synthetic
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-monitor-report
+          path: app/test-results/
+          retention-days: 7
+
+      - name: Clean up canary subscription and reset account
+        if: always()
+        run: pnpm synthetic:cleanup
