@@ -136,6 +136,16 @@ jobs:
       - name: Run subscription lifecycle against production
         run: pnpm test:e2e:synthetic
 
+      # Solo se alcanza si el paso anterior tuvo éxito -- deja constancia en
+      # HeartbeatLog, de donde /confianza calcula la disponibilidad real.
+      # Secreto dedicado (no CRON_SECRET): este repo es público y el peor
+      # caso de una filtración debe ser solo un latido falso, nunca acceso
+      # a rutas destructivas del backend.
+      - name: Notify heartbeat endpoint
+        run: |
+          curl -sf -X POST "https://miwebdeboda.com/api/monitor/heartbeat" \
+            -H "Authorization: Bearer ${{ secrets.SYNTHETIC_MONITOR_SECRET }}"
+
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
