@@ -3,12 +3,18 @@ name: Synthetic Stripe Subscription Monitor
 on:
   schedule:
     # 08:00 UTC todos los dias — fuera de horas punta, antes de que empiece
-    # el trafico real del dia en España.
+    # el trafico real del dia en España. La ejecucion programada corre SIN
+    # proxy (IP del runner de GitHub): comprueba lo esencial — que el ciclo
+    # de suscripcion en produccion funciona — sin depender de infra de
+    # terceros (Webshare) que ya ha fallado dos veces (proxies borrados por
+    # accidente 2026-07; tunel a checkout.stripe.com caido / bloqueo de IP
+    # de datacenter por Stripe Radar desde ~2026-08-26). La cobertura
+    # multi-region (ES/MX/US via proxy) pasa a ser manual, bajo demanda.
     - cron: "0 8 * * *"
   workflow_dispatch:
     inputs:
       region:
-        description: "Región a probar (ES, MX o US). Vacío = la que toque hoy por rotación."
+        description: "Región a probar VIA PROXY (ES/MX/US). Vacío = sin proxy, desde la IP del runner (igual que el cron diario)."
         required: false
         type: choice
         options: ["", "ES", "MX", "US"]
@@ -67,20 +73,21 @@ jobs:
       - name: Generate Prisma client
         run: pnpm db:generate
 
-      - name: Determine today's region
+      # Solo hay region (y por tanto proxy) cuando se lanza a mano con una
+      # elegida. El cron diario y los dispatch sin region dejan REGION vacia
+      # y corren sin proxy.
+      - name: Determine region (proxy solo en dispatch manual con region)
         run: |
-          if [ -n "${{ inputs.region }}" ]; then
-            REGION="${{ inputs.region }}"
+          REGION="${{ inputs.region }}"
+          if [ -n "$REGION" ]; then
+            echo "Ejecucion regional VIA PROXY: $REGION"
           else
-            DOW=$(date -u +%u)
-            IDX=$(( (DOW - 1) % 3 ))
-            REGIONS=(ES MX US)
-            REGION="${REGIONS[$IDX]}"
+            echo "Ejecucion SIN PROXY (IP del runner de GitHub)"
           fi
-          echo "Región de hoy: $REGION"
           echo "REGION=$REGION" >> "$GITHUB_ENV"
 
-      - name: Resolve proxy credentials for today's region
+      - name: Resolve proxy credentials for the requested region
+        if: env.REGION != ''
         run: |
           case "$REGION" in
             ES)
@@ -131,6 +138,7 @@ jobs:
         run: pnpm exec playwright install-deps chromium
 
       - name: Check proxy region
+        if: env.REGION != ''
         run: npx tsx scripts/synthetic-monitor-check-proxy-region.ts
 
       - name: Run subscription lifecycle against production
